@@ -17,6 +17,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+import intel_extension_for_pytorch as ipex
+
 from ultralytics.utils import (
     DEFAULT_CFG_DICT,
     DEFAULT_CFG_KEYS,
@@ -76,7 +78,7 @@ def smart_inference_mode():
     return decorate
 
 
-def autocast(enabled: bool, device: str = "cuda"):
+def autocast(enabled: bool, device: str = None):
     """
     Get the appropriate autocast context manager based on PyTorch version and AMP setting.
 
@@ -101,11 +103,14 @@ def autocast(enabled: bool, device: str = "cuda"):
             pass
         ```
     """
+    if device is None:
+        device = "cuda" if torch.cuda.is_available() else "xpu" if torch.xpu.is_available() else None
+
     if TORCH_1_13:
         return torch.amp.autocast(device, enabled=enabled)
     else:
-        return torch.cuda.amp.autocast(enabled)
-
+        # return torch.cuda.amp.autocast(enabled)
+        return torch.cuda.amp.autocast(enabled) if torch.cuda.is_available() else torch.xpu.amp.autocast(enabled) if torch.xpu.is_available() else None
 
 def get_cpu_info():
     """Return a string with system CPU information, i.e. 'Apple M2'."""
@@ -130,6 +135,12 @@ def get_gpu_info(index):
     return f"{properties.name}, {properties.total_memory / (1 << 20):.0f}MiB"
 
 
+def get_xpu_info(index):
+    """Return a string with system Intel GPU information."""
+    properties = torch.xpu.get_device_properties(index)
+    return f"{properties.name}, {properties.total_memory / (1 << 20):.0f}MiB"
+
+
 def select_device(device="", batch=0, newline=False, verbose=True):
     """
     Selects the appropriate PyTorch device based on the provided arguments.
@@ -140,7 +151,7 @@ def select_device(device="", batch=0, newline=False, verbose=True):
 
     Args:
         device (str | torch.device, optional): Device string or torch.device object.
-            Options are 'None', 'cpu', or 'cuda', or '0' or '0,1,2,3'. Defaults to an empty string, which auto-selects
+            Options are 'None', 'cpu', 'cuda', or 'xpu' or '0' or '0,1,2,3'. Defaults to an empty string, which auto-selects
             the first available GPU, or CPU if no GPU is available.
         batch (int, optional): Batch size being used in your model. Defaults to 0.
         newline (bool, optional): If True, adds a newline at the end of the log string. Defaults to False.
@@ -157,6 +168,9 @@ def select_device(device="", batch=0, newline=False, verbose=True):
         >>> select_device("cuda:0")
         device(type='cuda', index=0)
 
+        >>> select_device("xpu:0")
+        device(type='xpu', index=0)
+
         >>> select_device("cpu")
         device(type='cpu')
 
@@ -168,12 +182,34 @@ def select_device(device="", batch=0, newline=False, verbose=True):
 
     s = f"Ultralytics {__version__} 🚀 Python-{PYTHON_VERSION} torch-{torch.__version__} "
     device = str(device).lower()
+    print("*************************************")
+    print(f"{device=}\n")
+
     for remove in "cuda:", "none", "(", ")", "[", "]", "'", " ":
         device = device.replace(remove, "")  # to string, 'cuda:0' -> '0' and '(0, 1)' -> '0,1'
     cpu = device == "cpu"
     mps = device in {"mps", "mps:0"}  # Apple Metal Performance Shaders (MPS)
+    xpu = device == "xpu" # Intel GPU (xpu)
     if cpu or mps:
         os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # force torch.cuda.is_available() = False
+    elif xpu:
+        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # force torch.cuda.is_available() = False
+        if not (torch.xpu.is_available() and torch.xpu.device_count() >= len(device.split(","))):
+            LOGGER.info(s)
+            install = (
+                "See https://intel.github.io/intel-extension-for-pytorch/ for up-to-date torch install instructions if no "
+                "xpu devices are seen by torch.\n"
+                if torch.xpu.device_count() == 0
+                else ""
+            )
+            raise ValueError(
+                f"Invalid xpu 'device={device}' requested."
+                f" Use 'device=cpu' or pass valid xpu device(s) if available,"
+                f" i.e. 'device=0' or 'device=0,1,2,3' for Multi-GPU.\n"
+                f"\ntorch.xpu.is_available(): {torch.xpu.is_available()}"
+                f"\ntorch.xpu.device_count(): {torch.xpu.device_count()}"
+                f"{install}"
+            )
     elif device:  # non-cpu device requested
         if device == "cuda":
             device = "0"
@@ -217,6 +253,24 @@ def select_device(device="", batch=0, newline=False, verbose=True):
         for i, d in enumerate(devices):
             s += f"{'' if i == 0 else space}CUDA:{d} ({get_gpu_info(i)})\n"  # bytes to MB
         arg = "cuda:0"
+    elif xpu and torch.xpu.is_available():
+        devices = device.split(",") if device else "0"  # i.e. "0,1" -> ["0", "1"]
+        n = len(devices)  # device count
+        if n > 1:  # multi-GPU
+            if batch < 1:
+                raise ValueError(
+                    "AutoBatch with batch<1 not supported for Multi-GPU training, "
+                    "please specify a valid batch size, i.e. batch=16."
+                )
+            if batch >= 0 and batch % n != 0:  # check batch_size is divisible by device_count
+                raise ValueError(
+                    f"'batch={batch}' must be a multiple of GPU count {n}. Try 'batch={batch // n * n}' or "
+                    f"'batch={batch // n * n + n}', the nearest batch sizes evenly divisible by {n}."
+                )
+        space = " " * (len(s) + 1)
+        for i, d in enumerate(devices):
+            s += f"{'' if i == 0 else space}xpu:{d} ({get_xpu_info(i)})\n"  # bytes to MB
+        arg = "xpu:0"
     elif mps and TORCH_2_0 and torch.backends.mps.is_available():
         # Prefer MPS if available
         s += f"MPS ({get_cpu_info()})\n"
@@ -236,6 +290,8 @@ def time_sync():
     """PyTorch-accurate time."""
     if torch.cuda.is_available():
         torch.cuda.synchronize()
+    elif torch.xpu.is_available():
+        torch.xpu.synchronize()
     return time.time()
 
 
@@ -483,8 +539,12 @@ def init_seeds(seed=0, deterministic=False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)  # for Multi-GPU, exception safe
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)  # for Multi-GPU, exception safe
+    elif torch.xpu.is_available():
+        torch.xpu.manual_seed(seed)
+        torch.xpu.manual_seed_all(seed)  # for Multi-GPU, exception safe
     # torch.backends.cudnn.benchmark = True  # AutoBatch problem https://github.com/ultralytics/yolov5/issues/9287
     if deterministic:
         if TORCH_2_0:
@@ -634,12 +694,13 @@ def profile(input, ops, n=10, device=None, max_num_obj=0):
     results = []
     if not isinstance(device, torch.device):
         device = select_device(device)
+        #! Self: Debug or perform checks here
     LOGGER.info(
         f"{'Params':>12s}{'GFLOPs':>12s}{'GPU_mem (GB)':>14s}{'forward (ms)':>14s}{'backward (ms)':>14s}"
         f"{'input':>24s}{'output':>24s}"
     )
     gc.collect()  # attempt to free unused memory
-    torch.cuda.empty_cache()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else torch.xpu.empty_cache() if torch.xpu.is_available() else None
     for x in input if isinstance(input, list) else [input]:
         x = x.to(device)
         x.requires_grad = True
@@ -673,7 +734,11 @@ def profile(input, ops, n=10, device=None, max_num_obj=0):
                             device=device,
                             dtype=torch.float32,
                         )
-                mem = torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0  # (GB)
+                mem = (
+                    torch.cuda.memory_reserved() / 1e9
+                    if torch.cuda.is_available()
+                    else torch.xpu.memory_reserved() / 1e9 if torch.xpu.is_available() else 0
+                )
                 s_in, s_out = (tuple(x.shape) if isinstance(x, torch.Tensor) else "list" for x in (x, y))  # shapes
                 p = sum(x.numel() for x in m.parameters()) if isinstance(m, nn.Module) else 0  # parameters
                 LOGGER.info(f"{p:12}{flops:12.4g}{mem:>14.3f}{tf:14.4g}{tb:14.4g}{str(s_in):>24s}{str(s_out):>24s}")
@@ -683,7 +748,7 @@ def profile(input, ops, n=10, device=None, max_num_obj=0):
                 results.append(None)
             finally:
                 gc.collect()  # attempt to free unused memory
-                torch.cuda.empty_cache()
+                torch.cuda.empty_cache() if torch.cuda.is_available() else torch.xpu.empty_cache() if torch.xpu.is_available() else None
     return results
 
 

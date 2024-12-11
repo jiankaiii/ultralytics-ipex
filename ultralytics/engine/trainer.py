@@ -54,6 +54,7 @@ from ultralytics.utils.torch_utils import (
     torch_distributed_zero_first,
 )
 
+import intel_extension_for_pytorch as ipex
 
 class BaseTrainer:
     """
